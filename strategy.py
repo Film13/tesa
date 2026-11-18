@@ -163,8 +163,21 @@ def history_markup(memory: object, buyer: str, buyer_type: str) -> float:
     elif above is not None:
         estimate = above - 0.02
     if estimate is None:
-        return base
-    return (1 - HISTORY_WEIGHT) * base + HISTORY_WEIGHT * estimate
+        estimate = base
+    else:
+        estimate = (1 - HISTORY_WEIGHT) * base + HISTORY_WEIGHT * estimate
+
+    # A buyer's ABOVE_LIMIT result is an explicit ceiling signal. Keep this cap
+    # across games too, so a restart/new game does not repeat a price already
+    # rejected by this exact buyer. Use the lowest rejected markup as the
+    # conservative bound; current-game evidence is enforced again in buyer_markup.
+    history = getattr(memory, "buyer_history", {}).get(buyer, {}) if memory is not None else {}
+    rejected = [o.get("markup") for o in history.get("observations", [])
+                if o.get("status") == "ABOVE_LIMIT" and isinstance(o.get("markup"), (int, float))]
+    if rejected:
+        margin = ABOVE_LIMIT_MARGIN_BY_TYPE.get(buyer_type, ABOVE_LIMIT_MARGIN)
+        estimate = min(estimate, min(rejected) - margin)
+    return estimate
 
 
 def _round_number(round_id) -> int | None:
