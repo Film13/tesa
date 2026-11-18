@@ -850,6 +850,21 @@ def capacity_split(state: dict, ctx: Context, by_lot: dict, wanted: dict) -> dic
         out[i] += n
         cap_bags -= n
 
+    # Protect one bag per eligible RFQ before spending the round's capacity on
+    # higher-volume candidates. This prevents a compatible store being starved
+    # just because another lot has a better expected gain.
+    rfq_room = {r["rfq_id"]: r["bags"] for r in state["rfqs"]}
+    for r in sorted(state["rfqs"], key=lambda row: (TYPE_RANK.get(row["buyer_type"], 99), row["rfq_id"])):
+        options = [c for opts in by_lot.values() for c in opts
+                   if c["rfq_id"] == r["rfq_id"] and wanted.get(c["lot_id"], 0) > out[c["lot_id"]]]
+        if cap_bags <= 0 or rfq_room[r["rfq_id"]] <= 0 or not options:
+            continue
+        c = max(options, key=lambda x: (offer_gain(x, ctx), -ctx.tv[x["lot_id"]]))
+        before = out[c["lot_id"]]
+        give(c["lot_id"], 1)
+        if out[c["lot_id"]] > before:
+            rfq_room[r["rfq_id"]] -= 1
+
     for i in order:                                              # 0. narrow lots whose buyer is here
         if i in narrow:
             give(i, pace_of(i))
