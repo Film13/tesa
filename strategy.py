@@ -15,7 +15,7 @@ Sales policy
   - Later rounds: each buyer's price moves with what happened last round (our results and how the other
     sellers fared in market_summary), so the beans sell.
   - INSTANT starts at TV (markup 1.00) and steps down until it sells.
-  - Offer about 70 % of what is left each round (10 bags -> 7), everything in the final round.
+  - Offer about 70 % of available stock through the first half, release the rest in the second half.
 
 price_per_kg = markup × our TV estimate. A markup of 1.00 asks exactly what we think the lot is worth.
 """
@@ -45,12 +45,10 @@ HISTORY_WEIGHT = 0.3                  # past games are a behaviour hint, not a r
 # How a buyer's markup moves after a round (in markup units, 0.01 = 1 % of TV)
 STEP_ACCEPTED_SPARE_DEMAND = 0.012    # sold everything and the buyer still wanted more -> ask more
 STEP_ACCEPTED = 0.006                 # sold everything, buyer was full -> nudge up
-# OUTBID / PARTIAL: do NOT lower the price. The buyer's ceiling still has room; competitors run out of beans
-# in later rounds, so we hold those bags back (HOLD_SHARE) and sell them later at the same or a higher price.
+# OUTBID / PARTIAL: do NOT lower the price automatically. OUTBID affects price learning, not early offer volume.
 STEP_PARTIAL = 0.0
 STEP_OUTBID = 0.0
-HOLD_SHARE = 0.5                      # a lot that was OUTBID last round offers only 50 % (instead of 70 %)
-SPECIALTY_RESERVE = 0.5               # calendar says SPECIALTY comes later: keep 50 % of the lot (of kg_total) for it
+STEP_INSTANT_OUTBID = -0.02          # lower INSTANT by 2% after an OUTBID, then recheck against its paid-price floor
 # Sell-out mode. The Round Capacity (≈1.5 × an even share per round) is a hard market limit, so to sell every bag
 # the offers must SELL more often when stock is behind schedule. need = bags left ÷ (capacity bags × rounds left)
 # is the fill rate still required; above URGENT_FILL we are behind: urgency 0..1 grows with it.
@@ -394,7 +392,7 @@ def buyer_markup(state: dict, ctx: Context, buyer: str, buyer_type: str) -> floa
             else:
                 lost = [mk for s, mk in lesson["ours"][buyer] if s == "OUTBID"]
                 last_lost = min(lost) if lost else last_lost    # remembered, but no cut before the final round
-                m += step
+                m += STEP_INSTANT_OUTBID if buyer_type == "INSTANT" and lost else step
         else:
             # we did not sell to this buyer: learn from same-type buyers we did sell to, at half strength
             same = [_step_for(o, lesson["demand"].get(b))[0] for b, o in lesson["ours"].items()
@@ -462,6 +460,23 @@ def buyer_markup(state: dict, ctx: Context, buyer: str, buyer_type: str) -> floa
             m = min(m, best_sold + (0.0 if ceiling is not None else FINAL_ROUND_OVER_BEST_SOLD))
         if last_lost is not None:
             m = min(m, last_lost - FINAL_UNDER_LOST)            # just under where this buyer beat us
+    if buyer_type == "INSTANT":
+        # Round one is a clean x1.00 probe. Later reductions cannot go below the
+        # average markup this buyer paid us, or the comparable market average.
+        if is_first_round(state):
+            m = 1.00
+        else:
+            history = getattr(ctx.memory, "buyer_history", {}).get(buyer, {}) if ctx.memory else {}
+            accepted = [o["markup"] for o in history.get("observations", [])
+                        if o.get("status") in ("ACCEPTED", "PARTIAL")
+                        and (o.get("filled_kg") or 0) > 0 and isinstance(o.get("markup"), (int, float))]
+            floors = [statistics.mean(accepted)] if accepted else []
+            if mv and mv["rounds"] >= MARKET_MIN_ROUNDS and market_floor_sane(ctx, buyer, mv["avg"]):
+                floors.append(mv["avg"])
+            floor = min(1.00, max(floors, default=BOUNDS["INSTANT"][0]))
+            if ceiling is not None:
+                floor = min(floor, ceiling - 0.01)
+            m = max(m, floor)
     return round(min(max(m, MIN_MARKUP), MAX_MARKUP), 4)
 
 
@@ -538,38 +553,24 @@ def premium_lots(state: dict, ctx: Context) -> set[str]:
 
 
 def sell_budget(state: dict, ctx: Context) -> dict[str, int]:
-    """kg of each lot to offer this round. Starts at ~70 % of what is left (10 bags -> 7) and grows to 100 %
-    as the game goes on, so the middle and late rounds push more volume; all of it in the final round.
-    A lot that was OUTBID last round starts at HOLD_SHARE (also growing to 100 %). When behind schedule
-    (sell-out mode) every lot offers everything, and the SPECIALTY reserve shrinks."""
+    """Offer aggressively in the first half, aiming to sell at strong early prices; release all remaining
+    stock in the second half. No inventory is held back just for a possible future SPECIALTY RFQ."""
     final = is_final_round(state, ctx)
     u = urgency(state, ctx)
     rnd = state["round"]
     total = rnd.get("of") or ctx.rules["timeline"]["rounds"]
     progress = 0.0 if rnd["kind"] == "practice" or total <= 1 else (rnd["number"] - 1) / (total - 1)
-    lost = lots_outbid_last_round(ctx)
-    reserve = specialty_reserve(state, ctx)
     out = {}
     for lot in state["lots"]:
         bags = lot["kg_available"] // BAG
-        base = HOLD_SHARE if lot["lot_id"] in lost else OFFER_SHARE
-        if lot["lot_id"] in premium_lots(state, ctx):
-            base = OFFER_SHARE                    # priced above TV: offer the full 70 % so a sale sells a lot
-        share = 1.0 if u >= 0.5 else base + (1 - base) * progress
+        # First half: put up 70% of available stock for sale. Second half:
+        # progressively release the remaining 30%, reaching 100% by the final round.
+        share = 1.0 if final or u >= 0.5 else (
+            OFFER_SHARE if progress <= 0.5 else OFFER_SHARE + (1 - OFFER_SHARE) * ((progress - 0.5) * 2)
+        )
         if lot["lot_id"] in narrow_now(state, ctx):
             share = 1.0                       # few buyers take this lot: clear it while one is here
-        if final:
-            out[lot["lot_id"]] = bags * BAG
-        elif lot["lot_id"] in reserve:            # sell only what is above the SPECIALTY reserve
-            keep = math.ceil(lot.get("kg_total", lot["kg_available"]) // BAG * SPECIALTY_RESERVE * (1 - u))
-            free = max(0, bags - keep)
-            out[lot["lot_id"]] = min(free, math.ceil(free * share)) * BAG
-        else:
-            out[lot["lot_id"]] = min(bags, max(1, math.ceil(bags * share))) * BAG
-    for note, ids in ((f"hold back (OUTBID last round, no price cut): {sorted(lost & set(out))}", lost and u < 0.5),
-                      (f"keep for SPECIALTY rounds ahead: {sorted(reserve)}", reserve)):
-        if ids and not final and note not in ctx.notes:
-            ctx.notes.append(note)
+        out[lot["lot_id"]] = min(bags, max(1, math.ceil(bags * share))) * BAG if bags else 0
     return out
 
 
@@ -708,15 +709,9 @@ def candidates(state: dict, ctx: Context) -> list[dict]:
         ok = [r for r in passes if not spec_mismatched(ctx, lot["lot_id"], r["spec"])]
         if len(ok) < len(passes):
             ctx.notes.append(f"{lot['lot_id']} skips specs that gave SPEC_MISMATCH before")
-        premium = [r for r in ok if r["buyer_type"] in PREMIUM_TYPES]
-        instant = [r for r in ok if r["buyer_type"] == "INSTANT"]
-        if premium:
-            allowed = premium + (instant if final else [])   # final round: leftovers may still go to INSTANT
-        elif premium_capable(lot, state, ctx) and not final:
-            allowed = []                                     # wait for a better buyer next round
-            ctx.notes.append(f"{lot['lot_id']} waits for a COMMERCIAL/SPECIALTY RFQ")
-        else:
-            allowed = instant                                # nobody else can take this lot
+        # Buyer type affects priority, not eligibility: include every matching RFQ.
+        # Capacity allocation below covers each compatible RFQ when possible.
+        allowed = ok
         longshot = not passes                                # the sample fails every spec this round
         if longshot:
             allowed = [r for r in state["rfqs"] if r["buyer_type"] == "INSTANT"
@@ -902,7 +897,24 @@ def rule_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict]:
         return bags
 
     target = capacity_split(state, ctx, by_lot, {i: b // BAG for i, b in budget.items()})
+    target_left = dict(target)
     narrow = narrow_now(state, ctx)
+
+    # Give each compatible RFQ one bag first, subject to stock, RFQ size and round capacity.
+    # If capacity is too small, better-ranked buyer types get coverage first.
+    covered = set()
+    for r in sorted(state["rfqs"], key=lambda row: (TYPE_RANK.get(row["buyer_type"], 99), row["rfq_id"])):
+        choices = [c for c in cands if c["rfq_id"] == r["rfq_id"]
+                   and target_left.get(c["lot_id"], 0) > 0 and rfq_left.get(c["rfq_id"], 0) > 0]
+        if not choices:
+            continue
+        c = max(choices, key=lambda x: (x["markup"] * x["p_win"], -ctx.tv[x["lot_id"]]))
+        if give(c["lot_id"], c, 1):
+            target_left[c["lot_id"]] -= 1
+            covered.add(r["rfq_id"])
+    if covered:
+        ctx.notes.append("RFQ coverage: " + ", ".join(sorted(covered)))
+
     # narrow lots first: a lot any buyer takes must not use up the room of the one RFQ a narrow lot can use
     for lot_id in sorted(by_lot, key=lambda i: (narrow.get(i, NARROW_OUTLET), -ctx.tv[i])):
         # best type first; within a type prefer RFQs we have not loaded yet, so bags spread over every RFQ
@@ -910,7 +922,7 @@ def rule_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict]:
         used = {r["rfq_id"]: r["bags"] - rfq_left[r["rfq_id"]] for r in state["rfqs"]}
         options = sorted(by_lot[lot_id], key=lambda c: (type_rank(c, ctx),
                          -c["markup"] * c["p_win"] * SPREAD_DECAY ** used.get(c["rfq_id"], 0)))
-        bags_left = target.get(lot_id, 0)
+        bags_left = target_left.get(lot_id, 0)
         best_rank = type_rank(options[0], ctx)
         top = [c for c in options if type_rank(c, ctx) == best_rank and rfq_left[c["rfq_id"]] > 0][:2]
         if len(top) == 2 and bags_left >= 2 and top[1]["p_win"] >= MIN_SPLIT_P_WIN:
@@ -933,8 +945,8 @@ SYSTEM = """You are the sales agent of a coffee farm selling green robusta beans
 Each round buyers post RFQs. You choose which RFQs to offer your lots to and how many 60 kg bags.
 price = markup x the lot's True Value estimate (tv). Buyers rank offers by price / true value, cheapest first,
 and reject offers above their hidden ceiling. Unsold beans are worth only 0.80 x tv at the end.
-Policy: sell to SPECIALTY first, then COMMERCIAL; INSTANT only for lots no other buyer can take (the candidate
-list already follows this). Each candidate has the markup our pricing rules chose; you may go lower, never higher.
+Policy: prioritize SPECIALTY, then COMMERCIAL, then INSTANT, but cover each compatible RFQ when capacity permits.
+Each candidate has the markup our pricing rules chose; you may go lower, never higher.
 p_win is the estimated chance an offer to that RFQ sells: put more bags where p_win is higher.
 Volume: each round there is a hard cap on bags (Round Capacity). Use all of it when stock is left; the target
 bag count in the message is what our rules would offer. Never leave capacity unused while bags remain.
@@ -1165,8 +1177,14 @@ def decide(state: dict, ctx: Context) -> tuple[list[dict], str]:
         # rules fill whatever volume the LLM left unused (guard skips pairs already used, stops at capacity).
         narrow = narrow_now(state, ctx)
         reserved = [p for p in rules if p["lot_id"] in narrow]
-        offers = guard(state, ctx, reserved + plan + rules)
-        res_pairs = {(p["lot_id"], p["rfq_id"]) for p in reserved}
+        covered_rfqs = {p["rfq_id"] for p in reserved}
+        coverage = []
+        for p in rules:
+            if p["rfq_id"] not in covered_rfqs:
+                coverage.append({**p, "bags": 1})
+                covered_rfqs.add(p["rfq_id"])
+        offers = guard(state, ctx, reserved + coverage + plan + rules)
+        res_pairs = {(p["lot_id"], p["rfq_id"]) for p in reserved + coverage}
         llm_pairs = {(p["lot_id"], p["rfq_id"]) for p in plan} - res_pairs
         n_llm = sum((o["lot_id"], o["rfq_id"]) in llm_pairs for o in offers)
         if reserved:
