@@ -956,6 +956,7 @@ def rule_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict]:
 
 # ---------------------------------------------------------------- LLM (event gateway only in the competition)
 
+<<<<<<< HEAD
 SYSTEM = """You are the sales agent of a coffee farm selling green robusta beans in a sealed-offer market.
 Each round buyers post RFQs. You choose which RFQs to offer your lots to and how many 60 kg bags.
 price = markup x the lot's True Value estimate (tv). Buyers rank offers by price / true value, cheapest first,
@@ -973,6 +974,16 @@ Also fill "buyers": one short note per buyer in the message's buyer table, in TH
 situation (e.g. แพ้ราคา / ขายได้ / เกินเพดาน / ยังไม่เคยเสนอ), our last markup, the markup competitors won at,
 and the action this round (e.g. ลดเป็น x1.00 / คงราคา / ขึ้นราคา / ย้ายโควตาไปร้านอื่น), each under 120 characters.
 Answer only JSON matching the schema. Keep reason under 200 characters."""
+=======
+SYSTEM = """Allocate coffee bags from the supplied candidates to maximize PR (sales plus salvage at 0.80 x TV).
+Use the supplied TV estimate as given.
+Prioritize narrow lots and SPECIALTY > COMMERCIAL > INSTANT. Prefer higher p_win within each type.
+Aim for the round target within capacity and each candidate's max_bags. Use each candidate once at most.
+Keep candidate markup at zero urgency. At higher urgency favor sales and use only small discounts.
+OUTBID means competition; ABOVE_LIMIT means the buyer rejected the price.
+Return JSON matching the schema, with a brief reason and a short Thai note per listed buyer.
+Use only supplied facts. Omit unknown our_markup and winning_markup."""
+>>>>>>> 3acb5c66b3f8bc2cdff0b0ee54b3a3edc74e0538
 
 SCHEMA = {"type": "object", "required": ["offers", "reason", "buyers"], "properties": {
     "offers": {"type": "array", "items": {"type": "object", "required": ["candidate", "bags", "markup"], "properties": {
