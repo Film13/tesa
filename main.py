@@ -69,9 +69,19 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
         # the sandbox reuses lot ids every game, so the samples are what tell one game from the next
         lots_key = tuple(sorted((l["lot_id"], json.dumps(l["sample"], sort_keys=True)) for l in state["lots"]))
         if lots_key != game:                        # new game (or sandbox reset): start fresh
+            if game and not forever:
+                log("game_rollover_stop", market=state["market"])
+                return
             game, acted, tv = lots_key, set(), estimate_lots(rules, state["lots"])
             tag = hashlib.sha1(repr(lots_key).encode()).hexdigest()[:8]
-            memory = Memory(LOGS / f"memory-{state['market']}-{tag}.json")
+            buyer_tag = hashlib.sha1(f"{state['market']}:{state['team_id']}".encode()).hexdigest()[:12]
+            buyer_history_path = LOGS / f"buyer-history-{buyer_tag}.json"
+            import_legacy = not buyer_history_path.exists()
+            memory = Memory(LOGS / f"memory-{state['market']}-{tag}.json",
+                            buyer_history_path, game_id=tag)
+            if import_legacy:
+                memory.import_legacy_files(list(LOGS.glob(f"memory-{state['market']}-*.json")),
+                                           state["team_id"])
             log("new_game", market=state["market"], lots=len(state["lots"]), tv=tv)
         phase = state["phase"]
 
@@ -97,11 +107,22 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
                 offers, source = strategy.decide(state, ctx)
             except Exception as e:                  # noqa: BLE001 — a bug in strategy must not stop the agent
                 log("strategy_crashed", error=repr(e))
-                offers, source = strategy.guard(state, ctx, strategy.rule_plan(state, ctx, strategy.candidates(state, ctx))), "rules"
+                try:
+                    offers, source = strategy.guard(state, ctx, strategy.rule_plan(state, ctx, strategy.candidates(state, ctx))), "rules"
+                except Exception as e2:             # noqa: BLE001 — even the rules failed: skip this round, keep running
+                    log("rules_crashed", error=repr(e2))
+                    offers, source = [], "none"
             sent = send_offers(api, offers) if offers else []
             memory.record_sent(rid, offers, state, tv)
             log("offers_sent", round=rid, source=source, n=len(sent), kg=sum(o["kg"] for o in sent),
                 seconds=round(time.time() - t0, 1), offers=offers, notes=ctx.notes)
+            for note in ctx.notes:                  # readable per-buyer view in the console, e.g.
+                if note.startswith(("view:", "llm reason:", "llm failed:")):   # one Thai line per buyer + the LLM reason
+                    print("    " + note, flush=True)
+            if ctx.llm_io:                          # the exact LLM prompt and answer, kept apart from decisions.jsonl
+                with open(LOGS / "llm.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"), **ctx.llm_io},
+                                       ensure_ascii=False) + "\n")
 
         elif phase == "CLOSED" and game is not None and "closed" not in acted:
             acted.add("closed")

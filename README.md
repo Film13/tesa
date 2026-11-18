@@ -8,7 +8,7 @@ agent ตั้งต้นที่ **รันได้ทันทีแล�
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt      # Mac/Linux: .venv/bin/pip
 cp .env.example .env                                # Windows: copy .env.example .env · แล้วใส่ MARKET_URL, TEAM_KEY, LLM_*
-.venv/Scripts/python main.py                        # เล่นจนตลาดปิด
+.venv/Scripts/python main.py                        # เล่นเกมเดียว; หยุดเมื่อปิดตลาดหรือพบเกมใหม่
 .venv/Scripts/python main.py --forever              # sandbox: เล่นต่อเกมใหม่ไปเรื่อยๆ
 ```
 
@@ -73,10 +73,10 @@ cp .env.example .env                                # Windows: copy .env.example
 
 ## ทำให้เก่งขึ้น (`# TODO` ในโค้ด)
 
-- **markup ต่อ Buyer Type และปรับตามผลรอบก่อน** (`strategy.py` `MARKUP`) — ผู้ซื้อแต่ละประเภทยอมจ่ายไม่เท่ากัน
+- **ปรับ premium เป็นบาทต่อกก. แยกร้าน** (`memory.py`) — ผลขายได้เป็นขอบล่าง, `ABOVE_LIMIT` เป็นขอบบน; เกมถัดไปเริ่มที่ขอบบนลบ buffer 1 บาท/กก. หรือเพิ่มจากราคาที่ขายได้ 1 บาท/กก. หากยังไม่พบขอบบน; ราคายังถูกจำกัด 0.85–1.30×TV
 - **noise ของ Sample** — ล็อตที่ค่าใกล้ขอบเกรด/สเปก (`appraisal.py`, `spec_ok`)
 - **Market Calendar** — ขายมากขึ้นช่วงเทศกาล น้อยลงช่วงใกล้ปิดตลาด (`sell_budget`)
-- **นิสัยของผู้ซื้อแต่ละราย** — สรุปจาก `market_summary` หลายรอบ (`memory.py`)
+- บันทึกพฤติกรรมร้านข้ามเกมใน `logs/buyer-history-*.json`: เก็บส่วนต่างบาท/กก.จาก TV ที่เสนอ พร้อมผล `ACCEPTED`/`PARTIAL`/`OUTBID`/`ABOVE_LIMIT`; `OUTBID` เป็นหลักฐานว่าราคาเข้าเพดานแต่แพ้คู่แข่ง จึงทดลองขยับ premium ขึ้น ส่วน `ABOVE_LIMIT` เป็นขอบบน
 - **thinking mode** (`LLM_THINKING=1`) ฉลาดขึ้นแต่ช้ามาก และอาจคิดจน token หมดโดยไม่ตอบ — ถ้าเปิดต้องดูเวลา
 
 ## ส่งโค้ดให้กรรมการ (`pack.py`)
@@ -97,3 +97,5 @@ python pack.py           # สร้าง handin.zip อย่างเดี�
 - ห้ามส่งคำสั่งด้วยมือระหว่างแข่ง — agent ต้องทำเอง (ตรวจ log 5 อันดับแรก)
 - อ่านเวลาจาก `/v1/state` เสมอ อย่า hardcode เวลารอบ (sandbox รอบสั้นกว่าวันแข่ง)
 - เรียก API ได้ไม่เกิน 5 ครั้ง/วินาที
+#   t e s a  
+ 
