@@ -1118,39 +1118,34 @@ def rule_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict]:
 
 # ---------------------------------------------------------------- LLM (event gateway only in the competition)
 
+<<<<<<< HEAD
 SYSTEM = """You are the sales agent of a coffee farm selling green robusta beans in a sealed-offer market.
 Each round buyers post RFQs. You choose which RFQs to offer your lots to and how many 60 kg bags.
 price = markup x the lot's True Value estimate (tv). Buyers rank offers by price / true value, cheapest first,
 and reject offers above their hidden ceiling. Unsold beans are worth only 0.80 x tv at the end.
 Policy: prioritize SPECIALTY, then COMMERCIAL, then INSTANT, but cover each compatible RFQ when capacity permits.
-Spread every round over ALL lots with bags left (each lot is already given 1 bag by the rules): never spend the
-round on one lot, so we learn the price level of every lot and none is left over for the end.
-Each candidate has the markup our pricing rules chose; you may go lower, never higher. Treat 0.89 x TV as a
-soft floor for your own discounts: do not choose below 0.89 unless that candidate's supplied rule markup is
-already below 0.89 (for example, a buyer ceiling or INSTANT baht cap). Start from our_last for that buyer when
-available. Compare its status and markup with the highest and average competitor prices that actually sold to
-that buyer. After OUTBID, adjust our previous price toward the observed competitor sold range, using the highest
-sold price as a reference; make only a measured change and never exceed the candidate markup. Do not treat the
-competitor maximum as the buyer's hidden ceiling. If our offer sold, do not cut just because the competitor range
-is lower. If there is no competitor data, keep close to our rule candidate and our previous price.
+Each candidate has the markup our pricing rules chose; you may go lower, never higher.
 p_win is the estimated chance an offer to that RFQ sells: put more bags where p_win is higher.
 Volume: each round there is a hard cap on bags (Round Capacity). Use all of it when stock is left; the target
 bag count in the message is what our rules would offer. Never leave capacity unused while bags remain.
 Narrow lots (few buyers accept them, listed in the message) must be offered first, all bags, while their buyer is here.
 Sell-out urgency 0..1: above 0 we are behind schedule; the higher it is, the more you should favour high p_win
 and offer every bag, even at a slightly lower markup. At 0, keep the markups and do not undercut.
-OUTBID is not a reason to lower premium-buyer prices unless urgency is above 0. INSTANT starts at x1.00 and steps down by 0.02 after OUTBID, but stays above the buyer's known average paid price when available. ABOVE_LIMIT means that buyer's ceiling is lower.
+OUTBID is not a reason to lower the price unless urgency is above 0. ABOVE_LIMIT means that buyer's ceiling is lower.
 Also fill "buyers": one short note per buyer in the message's buyer table, in THAI, so the team can read it:
 situation (e.g. แพ้ราคา / ขายได้ / เกินเพดาน / ยังไม่เคยเสนอ), our last markup, the markup competitors won at,
 and the action this round (e.g. ลดเป็น x1.00 / คงราคา / ขึ้นราคา / ย้ายโควตาไปร้านอื่น), each under 120 characters.
-Answer with one JSON object only, in this shape (placeholders in <>, fill them from the current message):
-{"offers":[{"candidate":<int>,"bags":<int>,"markup":<number>}],"reason":"<text>","buyers":[{"buyer":"<name>","situation":"<Thai>","our_markup":<number>,"winning_markup":<number>,"action":"<Thai>"}]}
-offers: the offers to send ([] if none). candidate: the integer id copied from the Candidates list; bags: whole 60 kg bags;
-markup: price multiplier (1.04 = 104 % of tv). reason: one short sentence on the overall plan, under 200 characters.
-buyers: one entry per buyer in the buyer table. buyer: exact name; situation: Thai status under 60 characters;
-action: Thai next step under 120 characters. Optional numbers: our_markup = our_last.markup;
-winning_markup = competitors_sold.max_markup (the highest observed competitor sale). Use only supplied facts:
-omit our_markup if our_last is null and winning_markup if competitors_sold is null. Never invent numbers."""
+Answer only JSON matching the schema. Keep reason under 200 characters."""
+=======
+SYSTEM = """Allocate coffee bags from the supplied candidates to maximize PR (sales plus salvage at 0.80 x TV).
+Use the supplied TV estimate as given.
+Prioritize narrow lots and SPECIALTY > COMMERCIAL > INSTANT. Prefer higher p_win within each type.
+Aim for the round target within capacity and each candidate's max_bags. Use each candidate once at most.
+Keep candidate markup at zero urgency. At higher urgency favor sales and use only small discounts.
+OUTBID means competition; ABOVE_LIMIT means the buyer rejected the price.
+Return JSON matching the schema, with a brief reason and a short Thai note per listed buyer.
+Use only supplied facts. Omit unknown our_markup and winning_markup."""
+>>>>>>> 3acb5c66b3f8bc2cdff0b0ee54b3a3edc74e0538
 
 SCHEMA = {"type": "object", "required": ["offers", "reason", "buyers"], "properties": {
     "offers": {"type": "array", "items": {"type": "object", "required": ["candidate", "bags", "markup"], "properties": {
