@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import game_summary
 import strategy
 from appraisal import appraisal_items, estimate_lots
 from llm import LLM
@@ -52,6 +53,23 @@ def send_offers(api: Market, offers: list[dict]) -> list[dict]:
         except MarketError as e:
             log("offer_rejected", offer=o, error=str(e))
     return sent
+
+
+def save_game_summary(api: Market, state: dict, tv: dict, memory: Memory) -> None:
+    """One PR summary row per game -> logs/game-summary.jsonl (real PR from reveal in the sandbox)."""
+    try:
+        reveal = None
+        if state.get("market") == "sandbox":
+            try:
+                reveal = api.call("GET", "/v1/sandbox/reveal")
+            except MarketError as e:
+                log("reveal_error", error=str(e))
+        row = game_summary.summarize(state, tv, memory, reveal, os.environ.get("RUN_LABEL"))
+        game_summary.append(row)
+        log("game_summary", pr=row.get("pr"), pr_est=row.get("pr_est"), kg_left=row.get("kg_left"))
+        print("    " + game_summary.one_line(row), flush=True)
+    except Exception as e:                          # noqa: BLE001 — a summary bug must not stop the agent
+        log("game_summary_error", error=repr(e))
 
 
 def play(api: Market, llm: LLM | None, forever: bool) -> None:
@@ -128,6 +146,7 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
             acted.add("closed")
             memory.record_results(state["last_results"])
             log("market_closed", standings=state["standings"])
+            save_game_summary(api, state, tv, memory)
             if not forever:
                 return
 
