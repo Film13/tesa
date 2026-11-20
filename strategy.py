@@ -25,9 +25,11 @@ import time
 from dataclasses import dataclass, field
 
 BAG = 60
-# Spec safety margin: the sample must be at least this much better than the RFQ limit (sample noise, see spec_ok)
-SPEC_MARGIN_DEFECT = 0.4              # percentage points of defects
-SPEC_MARGIN_MOISTURE = 0.2            # percentage points of moisture
+# Spec margin: 0 = follow the market's spec exactly (a lot whose sample passes the RFQ limit is offered).
+# (was 0.4 / 0.2: a 6.8 % defect lot never went to a ≤7 % COMMERCIAL buyer and ended in salvage.)
+# A wrong guess only costs SPEC_MISMATCH once: spec_mismatched() then skips that spec for the lot.
+SPEC_MARGIN_DEFECT = 0.0              # percentage points of defects
+SPEC_MARGIN_MOISTURE = 0.0            # percentage points of moisture
 MIN_MARKUP, MAX_MARKUP = 0.85, 1.20   # unsold beans go to salvage at 0.80 × TV, so never go near that
 LLM_MIN_MARKUP = 0.89                 # keep LLM discretionary discounts above 89% of our TV estimate
 
@@ -37,7 +39,7 @@ PREMIUM_TYPES = ("SPECIALTY", "COMMERCIAL")
 # competition 8001: SPECIALTY winners sold at x0.95-1.04 (avg ~x0.98), COMMERCIAL x0.94-1.07: start near those
 BASE_MARKUP = {"SPECIALTY": 1.07, "COMMERCIAL": 1.03, "INSTANT": 1.00}
 SPECIALTY_OVER_COMMERCIAL = 0.03      # SPECIALTY asks 3 % more than the best COMMERCIAL price, until it OUTBIDs us twice
-BOUNDS = {"SPECIALTY": (1.00, 1.20), "COMMERCIAL": (0.96, 1.12), "INSTANT": (0.90, 1.00)}
+BOUNDS = {"SPECIALTY": (1.00, 1.20), "COMMERCIAL": (0.98, 1.12), "INSTANT": (0.90, 1.00)}
 STEP_REPEAT_OUTBID = -0.01            # SPECIALTY/COMMERCIAL: OUTBID 2+ rounds in a row with no sale -> 1 % lower per round
 REPEAT_OUTBID_ROUNDS = 2
 URGENCY_NO_SOLD_FLOOR = 0.5           # above this urgency the "it just sold there" floor no longer holds the price up
@@ -106,7 +108,7 @@ FESTIVAL_HOLD_PER_ROUND = 1
 FESTIVAL_HOLD_MAX_SHARE = 0.5
 # A lot whose sample fails every spec: still try INSTANT at 0.82 × TV. Buyers check the TRUE quality, not the
 # noisy sample, so it may pass; if not we only get SPEC_MISMATCH and keep the beans (salvage pays 0.80 anyway).
-LONGSHOT_MARKUP = 0.82
+LONGSHOT_MARKUP = 0.89              # do not dump uncertain/no-spec lots at 0.82 x an appraisal that may be wrong
 
 
 @dataclass
@@ -134,9 +136,8 @@ class Context:
 
 
 def spec_ok(sample: dict, spec: dict) -> bool:
-    """Does the lot pass this spec with a safety margin? The 350 g sample is noisy (defect ±0.2–0.7 pp, moisture
-    ±0.1–0.4 pp seen in our games), and buyers check the TRUE quality. A sample right at the limit (e.g. defect
-    3.0 % vs max 3.0 %) is likely to fail -> SPEC_MISMATCH and a wasted round of capacity, so do not offer it."""
+    """Does the lot's sample pass this spec, as the market states it (SPEC_MARGIN_* = 0)? Buyers check the TRUE
+    quality, so a sample near the limit may still get SPEC_MISMATCH; spec_mismatched() stops repeating that."""
     return (sample["defect_pct"] <= spec["max_defect_pct"] - SPEC_MARGIN_DEFECT
             and sample["moisture_pct"] <= spec["max_moisture_pct"] - SPEC_MARGIN_MOISTURE
             and (spec["min_screen"] is None or sample["screen"] >= spec["min_screen"]))
@@ -530,22 +531,16 @@ def buyer_markup(state: dict, ctx: Context, buyer: str, buyer_type: str) -> floa
 
 
 def instant_baht_caps(state: dict, ctx: Context) -> dict[str, float]:
-    """INSTANT buyer -> baht/kg cap for this round (this game's evidence only):
-    - the lowest baht price it rejected from us as ABOVE_LIMIT, minus INSTANT_BAHT_MARGIN
-    - what the market paid it at the top (avg of price_max over the recent rounds), sliding toward the average
-      sold price as urgency rises (behind schedule: price where most sales happen, not at the edge)"""
+    """INSTANT buyer -> baht/kg cap for this round (this game's evidence only): what the market paid it at the top
+    (avg of price_max over the recent rounds). No slide toward the average price: the average is pulled down by
+    competitors' low-quality lots, and a high-TV lot then never got offered (TV 118 lot skipped 7 rounds).
+    ABOVE_LIMIT prices cap only the lot that was rejected (instant_rejected): a rejection of a TV-91 lot at 91 ฿
+    says nothing about a TV-118 lot of better quality."""
     if ctx.baht_caps is not None:
         return ctx.baht_caps
     memory = ctx.memory
-    u = urgency(state, ctx)
-    rejected: dict[str, list] = {}
     market: dict[str, list] = {}
     for result in getattr(memory, "rounds", []):
-        sent = {(o["rfq_id"], o["lot_id"]): o for o in getattr(memory, "sent", {}).get(result.get("round_id"), [])}
-        for o in result.get("my_offers", []):
-            s = sent.get((o.get("rfq_id"), o.get("lot_id")), {})
-            if o.get("status") == "ABOVE_LIMIT" and s.get("buyer_type") == "INSTANT" and o.get("price_per_kg"):
-                rejected.setdefault(s["buyer"], []).append(o["price_per_kg"])
         rows: dict[str, list] = {}
         for row in result.get("market_summary", []):
             if row.get("buyer_type") == "INSTANT" and row.get("price_max") and row.get("price_avg"):
@@ -554,33 +549,46 @@ def instant_baht_caps(state: dict, ctx: Context) -> dict[str, float]:
             market.setdefault(b, []).append((max(x for x, _ in rs), sum(a for _, a in rs) / len(rs)))
     out = {}
     for b in {r["buyer"] for r in state["rfqs"] if r["buyer_type"] == "INSTANT"}:
-        caps = []
-        if rejected.get(b):
-            caps.append(min(rejected[b]) * (1 - INSTANT_BAHT_MARGIN))
         recent = market.get(b, [])[-MARKET_RECENT:]
         if recent:
-            top = sum(x for x, _ in recent) / len(recent)
-            avg = sum(a for _, a in recent) / len(recent)
-            caps.append(top - (top - avg) * u)
-        if caps:
-            out[b] = round(min(caps), 2)
+            out[b] = round(sum(x for x, _ in recent) / len(recent), 2)
     ctx.baht_caps = out
     if out:
         ctx.notes.append("INSTANT baht caps: " + ", ".join(f"{b} {c:.1f}฿" for b, c in out.items()))
     return out
 
 
+def instant_rejected(ctx: Context, buyer: str, lot_id: str) -> float | None:
+    """Lowest baht/kg this INSTANT buyer rejected as ABOVE_LIMIT for THIS lot this game (None = never)."""
+    memory = ctx.memory
+    low = None
+    for result in getattr(memory, "rounds", []):
+        sent = {(o["rfq_id"], o["lot_id"]): o for o in getattr(memory, "sent", {}).get(result.get("round_id"), [])}
+        for o in result.get("my_offers", []):
+            s = sent.get((o.get("rfq_id"), o.get("lot_id")), {})
+            if (o.get("status") == "ABOVE_LIMIT" and o.get("lot_id") == lot_id and s.get("buyer") == buyer
+                    and o.get("price_per_kg")):
+                low = o["price_per_kg"] if low is None else min(low, o["price_per_kg"])
+    return low
+
+
 def lot_markup(state: dict, ctx: Context, rfq: dict, lot_id: str, markup: float) -> float | None:
-    """The markup for THIS lot at this RFQ: INSTANT buyers also get the baht cap (a high-TV lot asks less).
-    None = even INSTANT_MIN_MARKUP × TV is over the cap: offering it would only collect ABOVE_LIMIT."""
+    """The markup for THIS lot at this RFQ: INSTANT buyers also get the baht cap (market top price, and below the
+    price this buyer rejected for this same lot). None = even INSTANT_MIN_MARKUP × TV is over the cap; in the final
+    round we still offer at INSTANT_MIN_MARKUP (unsold beans pay only salvage 0.80)."""
     if rfq["buyer_type"] != "INSTANT":
         return markup
-    cap = instant_baht_caps(state, ctx).get(rfq["buyer"])
     tv = ctx.tv.get(lot_id)
-    if cap is None or not tv or markup * tv <= cap:
+    caps = [c for c in (instant_baht_caps(state, ctx).get(rfq["buyer"]),) if c]
+    rej = instant_rejected(ctx, rfq["buyer"], lot_id)
+    if rej:
+        caps.append(rej * (1 - INSTANT_BAHT_MARGIN))
+    if not caps or not tv or markup * tv <= min(caps):
         return markup
-    capped = cap / tv
-    return round(capped, 4) if capped >= INSTANT_MIN_MARKUP else None
+    capped = min(caps) / tv
+    if capped >= INSTANT_MIN_MARKUP:
+        return round(capped, 4)
+    return INSTANT_MIN_MARKUP if is_final_round(state, ctx) else None
 
 
 def rfq_markups(state: dict, ctx: Context) -> dict[str, float]:
@@ -765,16 +773,26 @@ def premium_capable(lot: dict, state: dict, ctx: Context) -> bool:
 
 
 def spec_mismatched(ctx: Context, lot_id: str, spec: dict) -> bool:
-    """Did a buyer with this exact spec already reject this lot's TRUE quality earlier this game?"""
+    """Will this spec reject the lot? True when a spec at least as LOOSE as this one (every limit equal or looser)
+    already said SPEC_MISMATCH to this lot this game: the true quality failed the looser spec, so it fails this
+    stricter one too. A looser spec than the one that failed is still worth a try.
+    Results whose spec we did not record (left over from an older run of the same sandbox game) are ignored."""
     memory = ctx.memory
     for result in getattr(memory, "rounds", []):
         sent = {(o["rfq_id"], o["lot_id"]): o for o in getattr(memory, "sent", {}).get(result.get("round_id"), [])}
         for o in result.get("my_offers", []):
             if o.get("lot_id") == lot_id and o.get("status") == "SPEC_MISMATCH":
-                s = sent.get((o.get("rfq_id"), lot_id), {})
-                if s.get("spec") in (None, spec):      # unknown spec (old log) counts as the same
+                failed = sent.get((o.get("rfq_id"), lot_id), {}).get("spec")
+                if failed and _at_least_as_strict(spec, failed):
                     return True
     return False
+
+
+def _at_least_as_strict(spec: dict, other: dict) -> bool:
+    """Every limit of spec is equal to or stricter than the same limit of other."""
+    return (spec["max_defect_pct"] <= other["max_defect_pct"]
+            and spec["max_moisture_pct"] <= other["max_moisture_pct"]
+            and (spec.get("min_screen") or 0) >= (other.get("min_screen") or 0))
 
 
 def win_chances(state: dict, ctx: Context) -> dict[str, float]:
@@ -865,19 +883,26 @@ def candidates(state: dict, ctx: Context) -> list[dict]:
             ctx.notes.append(f"{lot['lot_id']} skips INSTANT: premium buyer can accept this lot")
         longshot = not passes                                # the sample fails every spec this round
         if longshot:
-            # a lot no known buyer takes wastes round capacity: offer it only once every sellable lot is gone
-            if not unsellable(lot, state, ctx) or sellable_left(state, ctx):
+            # Probe an INSTANT-only lot early instead of waiting until every other lot is gone.
+            # A failed-spec sample can be noisy; early feedback gives later rounds time to find another outlet.
+            # Keep the premium-buyer rule: never divert a lot that a premium buyer is known to accept.
+            if not instant_only:
                 continue
             allowed = [r for r in state["rfqs"] if r["buyer_type"] == "INSTANT"
                        and not spec_mismatched(ctx, lot["lot_id"], r["spec"])]
             if allowed:
-                ctx.notes.append(f"{lot['lot_id']} fails every spec, other lots sold out: long shot to INSTANT "
-                                 f"at x{LONGSHOT_MARKUP}")
+                probe_markup = 1.00 if is_first_round(state) else LONGSHOT_MARKUP
+                ctx.notes.append(f"{lot['lot_id']} fails current specs: early INSTANT-only probe at x{probe_markup:.2f}")
         for r in allowed:
-            mk = LONGSHOT_MARKUP if longshot else lot_markup(state, ctx, r, lot["lot_id"], markups[r["rfq_id"]])
+            mk = (1.00 if is_first_round(state) else lot_markup(
+                state, ctx, r, lot["lot_id"], LONGSHOT_MARKUP
+            )) if longshot else lot_markup(state, ctx, r, lot["lot_id"], markups[r["rfq_id"]])
             if mk is None:
                 ctx.notes.append(f"{lot['lot_id']} skips {r['rfq_id']}: even x{INSTANT_MIN_MARKUP} is over "
                                  f"{r['buyer']}'s baht cap")
+                continue
+            if longshot and not is_first_round(state) and mk < LONGSHOT_MARKUP:
+                ctx.notes.append(f"{lot['lot_id']} skips {r['rfq_id']}: INSTANT cap is below the long-shot floor")
                 continue
             if not longshot and mk < MIN_MARKUP:
                 ctx.notes.append(f"{lot['lot_id']} skips {r['rfq_id']}: buyer ceiling is below the minimum viable markup")
@@ -983,6 +1008,16 @@ def capacity_split(state: dict, ctx: Context, by_lot: dict, wanted: dict) -> dic
        first), so no lot is starved and everything can still be offered before the market closes
     2. the spare capacity (the extra 0.5×) goes to the lots whose best offer gains most over salvage:
        (markup − 0.80) × TV × chance to sell; a 0.82 long shot or a crowded RFQ comes last."""
+    # Until an INSTANT-only long-shot lot has actually sold, use one bag to test
+    # whether its noisy sample is misleading. If it sells, later rounds may scale up.
+    sold_lots = {o.get("lot_id") for rnd in getattr(ctx.memory, "rounds", [])
+                 for o in rnd.get("my_offers", []) if (o.get("filled_kg") or 0) >= BAG}
+    room = {i: sum({c["rfq_id"]: c["rfq_bags"] for c in opts}.values()) for i, opts in by_lot.items()}
+    for i, opts in by_lot.items():
+        if opts and all(c.get("longshot") for c in opts) and i not in sold_lots:
+            room[i] = min(room[i], 1)
+    wanted = {i: min(wanted.get(i, 0), room.get(i, 0)) for i in by_lot}
+
     cap = state.get("capacity_left_kg")
     if cap is None or sum(wanted.get(i, 0) for i in by_lot) <= cap // BAG:
         ctx.lot_target = {i: wanted.get(i, 0) for i in by_lot}
@@ -995,9 +1030,6 @@ def capacity_split(state: dict, ctx: Context, by_lot: dict, wanted: dict) -> dic
     narrow = narrow_now(state, ctx)
     # narrow lots whose buyer is here first (fewest chances left to sell), the rest by gain
     order = sorted(by_lot, key=lambda i: (narrow.get(i, NARROW_OUTLET), -best_gain[i]))
-    # a lot can only use as many bags as the RFQs it may go to can take (e.g. one 4-bag RFQ -> at most 4)
-    room = {i: sum({c["rfq_id"]: c["rfq_bags"] for c in opts}.values()) for i, opts in by_lot.items()}
-    wanted = {i: min(wanted.get(i, 0), room.get(i, 0)) for i in by_lot}
     out = {i: 0 for i in by_lot}
 
     def pace_of(i: str) -> int:
@@ -1118,34 +1150,31 @@ def rule_plan(state: dict, ctx: Context, cands: list[dict]) -> list[dict]:
 
 # ---------------------------------------------------------------- LLM (event gateway only in the competition)
 
-<<<<<<< HEAD
 SYSTEM = """You are the sales agent of a coffee farm selling green robusta beans in a sealed-offer market.
 Each round buyers post RFQs. You choose which RFQs to offer your lots to and how many 60 kg bags.
 price = markup x the lot's True Value estimate (tv). Buyers rank offers by price / true value, cheapest first,
 and reject offers above their hidden ceiling. Unsold beans are worth only 0.80 x tv at the end.
 Policy: prioritize SPECIALTY, then COMMERCIAL, then INSTANT, but cover each compatible RFQ when capacity permits.
-Each candidate has the markup our pricing rules chose; you may go lower, never higher.
+Each candidate has the markup our pricing rules chose; you may go lower, never higher. Treat 0.89 x TV as a
+soft floor for your own discounts: do not choose below 0.89 unless that candidate's supplied rule markup is
+already below 0.89 (for example, a buyer ceiling or INSTANT baht cap). Start from our_last for that buyer when
+available. Compare its status and markup with the highest and average competitor prices that actually sold to
+that buyer. After OUTBID, adjust our previous price toward the observed competitor sold range, using the highest
+sold price as a reference; make only a measured change and never exceed the candidate markup. Do not treat the
+competitor maximum as the buyer's hidden ceiling. If our offer sold, do not cut just because the competitor range
+is lower. If there is no competitor data, keep close to our rule candidate and our previous price.
 p_win is the estimated chance an offer to that RFQ sells: put more bags where p_win is higher.
 Volume: each round there is a hard cap on bags (Round Capacity). Use all of it when stock is left; the target
 bag count in the message is what our rules would offer. Never leave capacity unused while bags remain.
 Narrow lots (few buyers accept them, listed in the message) must be offered first, all bags, while their buyer is here.
 Sell-out urgency 0..1: above 0 we are behind schedule; the higher it is, the more you should favour high p_win
 and offer every bag, even at a slightly lower markup. At 0, keep the markups and do not undercut.
-OUTBID is not a reason to lower the price unless urgency is above 0. ABOVE_LIMIT means that buyer's ceiling is lower.
+OUTBID is not a reason to lower premium-buyer prices unless urgency is above 0. INSTANT starts at x1.00 and steps down by 0.02 after OUTBID, but stays above the buyer's known average paid price when available. ABOVE_LIMIT means that buyer's ceiling is lower.
 Also fill "buyers": one short note per buyer in the message's buyer table, in THAI, so the team can read it:
 situation (e.g. แพ้ราคา / ขายได้ / เกินเพดาน / ยังไม่เคยเสนอ), our last markup, the markup competitors won at,
 and the action this round (e.g. ลดเป็น x1.00 / คงราคา / ขึ้นราคา / ย้ายโควตาไปร้านอื่น), each under 120 characters.
-Answer only JSON matching the schema. Keep reason under 200 characters."""
-=======
-SYSTEM = """Allocate coffee bags from the supplied candidates to maximize PR (sales plus salvage at 0.80 x TV).
-Use the supplied TV estimate as given.
-Prioritize narrow lots and SPECIALTY > COMMERCIAL > INSTANT. Prefer higher p_win within each type.
-Aim for the round target within capacity and each candidate's max_bags. Use each candidate once at most.
-Keep candidate markup at zero urgency. At higher urgency favor sales and use only small discounts.
-OUTBID means competition; ABOVE_LIMIT means the buyer rejected the price.
-Return JSON matching the schema, with a brief reason and a short Thai note per listed buyer.
-Use only supplied facts. Omit unknown our_markup and winning_markup."""
->>>>>>> 3acb5c66b3f8bc2cdff0b0ee54b3a3edc74e0538
+Answer with one JSON object only, in the requested schema. Keep reason under 200 characters. Use supplied facts only.
+"""
 
 SCHEMA = {"type": "object", "required": ["offers", "reason", "buyers"], "properties": {
     "offers": {"type": "array", "items": {"type": "object", "required": ["candidate", "bags", "markup"], "properties": {
@@ -1257,7 +1286,7 @@ def guard(state: dict, ctx: Context, plan: list[dict]) -> list[dict]:
     offers, seen = [], set()
     for p in plan:
         lot, rfq = lots.get(p["lot_id"]), rfqs.get(p["rfq_id"])
-        # long shot: a lot that fails every spec may go to INSTANT only, at exactly LONGSHOT_MARKUP
+        # long shot: an INSTANT-only lot that fails every current spec can be probed early at its rule price.
         longshot = (p.get("longshot") and lot is not None and rfq is not None and rfq["buyer_type"] == "INSTANT"
                     and not any(spec_ok(lot["sample"], r["spec"]) for r in state["rfqs"]))
         if (p["lot_id"], p["rfq_id"]) in seen and lot is not None and rfq is not None:
@@ -1281,7 +1310,13 @@ def guard(state: dict, ctx: Context, plan: list[dict]) -> list[dict]:
         if kg < BAG:
             continue
         if longshot:
-            markup = LONGSHOT_MARKUP
+            markup = 1.00 if is_first_round(state) else max(LONGSHOT_MARKUP, p.get("markup", LONGSHOT_MARKUP))
+            if not is_first_round(state):
+                capped = lot_markup(state, ctx, rfq, lot["lot_id"], markup)
+                if capped is None or capped < LONGSHOT_MARKUP:
+                    ctx.notes.append(f"guard dropped {p['lot_id']} -> {p['rfq_id']}: INSTANT cap below long-shot floor")
+                    continue
+                markup = capped
         elif is_first_round(state) and rfq["buyer_type"] == "INSTANT":
             markup = 1.00                 # first-round probe: exactly our appraisal, without an early discount
         else:
@@ -1379,41 +1414,19 @@ def decide(state: dict, ctx: Context) -> tuple[list[dict], str]:
     plan = llm_plan(state, ctx, cands) if ctx.llm else None
     if plan:
         rules = rule_plan(state, ctx, cands)
-        # Round Capacity is first come, first served inside guard. Narrow lots (whose rare buyer is here now) get
-        # the rules' bags FIRST, so the LLM cannot spend the capacity they need; then the LLM's picks; then the
-        # rules fill whatever volume the LLM left unused (guard skips pairs already used, stops at capacity).
-        narrow = narrow_now(state, ctx)
-        reserved = [p for p in rules if p["lot_id"] in narrow]
-        # coverage: one bag of EVERY lot the rules offer this round (not one per RFQ: with 11 RFQs and a 5-bag
-        # capacity that used up the whole round and the LLM never got a bag). The LLM decides the rest.
-        covered_lots = {p["lot_id"] for p in reserved}
-        coverage = []
+        # Rules own the quantity and lot allocation: they cover the eligible lots and fill
+        # the feasible round capacity. The LLM may tune prices for the same lot/RFQ pairs,
+        # but must not change the volume plan (which previously caused unused capacity).
+        llm_prices = {(p["lot_id"], p["rfq_id"]): p["markup"] for p in plan}
+        volume_plan = []
         for p in rules:
-            if p["lot_id"] not in covered_lots:
-                coverage.append({**p, "bags": 1})
-                covered_lots.add(p["lot_id"])
-        plan = limit_llm_plan(state, ctx, plan, reserved + coverage)
-        # rules fill the rest, but each lot only up to its own share, so the LLM picking a different RFQ for a lot
-        # does not let that lot take the bags meant for another lot
-        left = dict(ctx.lot_target or {})
-        for p in reserved + coverage + plan:
-            left[p["lot_id"]] = left.get(p["lot_id"], 0) - p["bags"]
-        fill = []
-        for p in rules:
-            pre = sum(q["bags"] for q in reserved + coverage + plan
-                      if q["lot_id"] == p["lot_id"] and q["rfq_id"] == p["rfq_id"])
-            extra = min(p["bags"] - pre, left.get(p["lot_id"], 0))
-            if extra > 0:
-                fill.append({**p, "bags": pre + extra})      # guard tops a seen pair up to this total
-                left[p["lot_id"]] -= extra
-        offers = guard(state, ctx, reserved + coverage + plan + fill + rules)
-        res_pairs = {(p["lot_id"], p["rfq_id"]) for p in reserved + coverage}
-        llm_pairs = {(p["lot_id"], p["rfq_id"]) for p in plan} - res_pairs
-        n_llm = sum((o["lot_id"], o["rfq_id"]) in llm_pairs for o in offers)
-        if reserved:
-            ctx.notes.append(f"capacity reserved for narrow lots before the LLM: {sorted(narrow)}")
+            markup = min(p["markup"], llm_prices.get((p["lot_id"], p["rfq_id"]), p["markup"]))
+            volume_plan.append({**p, "markup": markup})
+        offers = guard(state, ctx, volume_plan)
+        n_llm = sum((p["lot_id"], p["rfq_id"]) in llm_prices for p in volume_plan)
+        ctx.notes.append(f"LLM price overlay on {n_llm}/{len(volume_plan)} rule volume allocations")
         buyer_report(state, ctx, offers, cands)
-        return offers, "llm" if len(offers) == n_llm else f"llm+rules ({n_llm}+{len(offers) - n_llm})"
+        return offers, f"llm+rules ({n_llm} price overlays; rules volume)"
     offers = guard(state, ctx, rule_plan(state, ctx, cands))
     buyer_report(state, ctx, offers, cands)
     return offers, "rules"

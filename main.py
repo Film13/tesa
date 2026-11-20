@@ -105,8 +105,9 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
 
         if phase == "APPRAISAL" and not state["appraisal_submitted"]:
             try:
-                api.appraise(appraisal_items(rules, state["lots"], tv))
-                log("appraisal_sent", tv=tv)
+                items = appraisal_items(rules, state["lots"], tv)
+                response = api.appraise(items)
+                log("appraisal_sent", tv=tv, request={"items": items}, response=response)
             except MarketError as e:
                 log("appraisal_error", error=str(e))
 
@@ -131,9 +132,10 @@ def play(api: Market, llm: LLM | None, forever: bool) -> None:
                     log("rules_crashed", error=repr(e2))
                     offers, source = [], "none"
             sent = send_offers(api, offers) if offers else []
-            memory.record_sent(rid, offers, state, tv)
+            # Learn from offers the API accepted, not the plan (batch fallback can reject some entries).
+            memory.record_sent(rid, sent, state, tv)
             log("offers_sent", round=rid, source=source, n=len(sent), kg=sum(o["kg"] for o in sent),
-                seconds=round(time.time() - t0, 1), offers=offers, notes=ctx.notes)
+                seconds=round(time.time() - t0, 1), offers=sent, planned_offers=offers, notes=ctx.notes)
             for note in ctx.notes:                  # readable per-buyer view in the console, e.g.
                 if note.startswith(("view:", "llm reason:", "llm failed:")):   # one Thai line per buyer + the LLM reason
                     print("    " + note, flush=True)
